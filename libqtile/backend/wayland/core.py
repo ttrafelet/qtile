@@ -60,6 +60,7 @@ from wlroots.wlr_types import (
     input_device,
     pointer,
     seat,
+    touch,
     xdg_activation_v1,
     xdg_decoration_v1,
 )
@@ -196,6 +197,7 @@ class Core(base.Core, wlrq.HasListeners):
         # Set up inputs
         self.keyboards: list[inputs.Keyboard] = []
         self._pointers: list[inputs.Pointer] = []
+        self.touch_devices: list[inputs.Touch] = []
         self.grabbed_keys: list[tuple[int, int]] = []
         DataDeviceManager(self.display)
         self.live_dnd: wlrq.Dnd | None = None
@@ -243,6 +245,7 @@ class Core(base.Core, wlrq.HasListeners):
         self._cursor_manager = XCursorManager(None, 24)
         self._gestures = PointerGesturesV1(self.display)
         self._pressed_button_count = 0
+        self._touch_finger_count = 0
         self._implicit_grab: ImplicitGrab | None = None
         self.add_listener(self.seat.request_set_cursor_event, self._on_request_cursor)
         self.add_listener(self.cursor.axis_event, self._on_cursor_axis)
@@ -258,6 +261,14 @@ class Core(base.Core, wlrq.HasListeners):
         self.add_listener(self.cursor.swipe_end, self._on_cursor_swipe_end)
         self.add_listener(self.cursor.hold_begin, self._on_cursor_hold_begin)
         self.add_listener(self.cursor.hold_end, self._on_cursor_hold_end)
+
+        # touch events
+        # https://wayland.emersion.fr/wlroots/wlr/types/wlr_cursor.h.html#struct-wlr_cursor
+        self.add_listener(self.cursor.touch_down_event, self._on_cursor_touch_down)
+        self.add_listener(self.cursor.touch_up_event, self._on_cursor_touch_up)
+        self.add_listener(self.cursor.touch_motion_event, self._on_cursor_touch_motion)
+        self.add_listener(self.cursor.touch_frame_event, self._on_cursor_touch_frame)
+
         self._cursor_state = wlrq.CursorState()
 
         # Set up shell
@@ -428,6 +439,8 @@ class Core(base.Core, wlrq.HasListeners):
             kb.finalize()
         for pt in self._pointers.copy():
             pt.finalize()
+        for tc in self.touch_devices.copy():
+            tc.finalize()
         for out in self._outputs.copy():
             out.finalize()
 
@@ -508,14 +521,11 @@ class Core(base.Core, wlrq.HasListeners):
             device = self._add_new_pointer(wlr_device)
         elif wlr_device.type == input_device.InputDeviceType.KEYBOARD:
             device = self._add_new_keyboard(wlr_device)
+        elif wlr_device.type == input_device.InputDeviceType.TOUCH:
+            device = self._add_new_touch(wlr_device)
         else:
             logger.info("New %s device", wlr_device.type.name)
             return
-
-        capabilities = WlSeat.capability.pointer
-        if self.keyboards:
-            capabilities |= WlSeat.capability.keyboard
-        self.seat.set_capabilities(capabilities)
 
         logger.info("New device: %s %s", *device.get_info())
         if hasattr(self, "qtile"):
@@ -523,6 +533,8 @@ class Core(base.Core, wlrq.HasListeners):
                 device.configure(self.qtile.config.wl_input_rules)
         else:
             self._pending_input_devices.append(device)
+
+        self.update_capabilities()
 
     def _on_new_output(self, _listener: Listener, wlr_output: wlrOutput) -> None:
         logger.debug("Signal: backend new_output_event")
@@ -849,6 +861,86 @@ class Core(base.Core, wlrq.HasListeners):
     ) -> None:
         self.idle.notify_activity(self.seat)
         self._gestures.send_hold_end(self.seat, event.time_msec, event.cancelled)
+
+
+    # MOD BY TRA
+    # TODO: how do we handle scrolling?
+    # TODO: we have to keep track of event.touch_id for multi-touch devices
+    # TODO: when touch is held for some/ time-period, treat it as a long press (-> alt mouse click?)
+
+
+    # FIXME: try figuring out the logic that is required for this work. We are able to:
+    # - move the cursor using motion (not really required)
+    # - click elements of qtile (like bar elements)
+
+    def _on_cursor_touch_down(self,
+                              _listener: Listener, event: touch.TouchDownEvent) -> None:
+        logger.debug("Detected touch down")
+        self._touch_finger_count += 1
+
+        self._on_cursor_touch_motion(_listener, event)
+
+        if self._implicit_grab is None:
+            found = self._focus_by_click()
+
+        if self._implicit_grab is not None:
+            logger.debug("Implicit grab touch down fired")
+            self.seat.touch_notify_down(self._implicit_grab.surface, event.time_msec, event.touch_id, self._implicit_grab.start_dx, self._implicit_grab.start_dy)
+
+        handled = False
+        if not self.exclusive_client:
+            # Force button=1 (left click) for now
+            # FIXME: This should really be handled on touch UP, instead of DOWN - it does work, though
+            # maybe we need to CHECK whether the touch WOULD BE HANDLED, instead of directly handling it?
+            handled = self._process_cursor_button(1, True)
+
+        if not handled: 
+            win, surface, sx, sy = found
+            logger.debug("No implicit grab found on touch down")
+            if surface:
+                self._create_implicit_grab(event.time_msec, surface, sx, sy)
+                self.seat.touch_notify_down(self._implicit_grab.surface, event.time_msec, event.touch_id, self._implicit_grab.start_dx, self._implicit_grab.start_dy)
+
+
+    def _on_cursor_touch_up(self,
+                              _listener: Listener, event: touch.TouchUpEvent) -> None:
+        # TODO: How do we make sure we do not fire a "click" after moving?
+        #           we need some kind of state, I guess?
+        logger.debug("Detected touch up")
+        self._touch_finger_count = max(0, self._touch_finger_count - 1)
+
+        # When uncommenting the following line, touch events on client surfaces will KIND OF work, but not really
+        #self.seat.pointer_notify_button(event.time_msec, wlrq.BTN_LEFT, input_device.ButtonState.PRESSED)
+
+        if self._implicit_grab is not None:
+            self.seat.touch_notify_up(event.time_msec, event.touch_id)
+            if self._touch_finger_count == 0:
+                self._release_implicit_grab(event.time_msec)
+            return
+
+        # FIXME: This should not be necessary? Yet without this, touches are not registered at all
+        # Maybe we are misunderstanding TouchDown and TouchUp? Maybe every event is handled on Touch Down?
+        self.seat.touch_notify_up(event.time_msec, event.touch_id)
+        
+    def _on_cursor_touch_motion(self,
+                              _listener: Listener, event: touch.TouchMotionEvent|touch.TouchDownEvent) -> None:
+        logger.debug("Detected touch motion")
+        # FIXME: Moving the cursor like this using touch does not really serve any purpose?
+
+        assert self.qtile is not None
+        self.idle.notify_activity(self.seat)
+
+        x, y = self.cursor.absolute_to_layout_coords(event.touch.base, event.x, event.y)
+        self.cursor.move(x - self.cursor.x, y - self.cursor.y)
+        if self._implicit_grab is None:
+            self._process_cursor_motion(event.time_msec, self.cursor.x, self.cursor.y)
+        else:
+            self._implicit_grab_motion(event.time_msec)
+
+    def _on_cursor_touch_frame(self,
+                              _listener: Listener, _data: Any) -> None:
+        logger.debug("Detected touch frame")
+        self.seat.touch_notify_frame()
 
     def _on_new_pointer_constraint(
         self, _listener: Listener, wlr_constraint: PointerConstraintV1
@@ -1237,6 +1329,20 @@ class Core(base.Core, wlrq.HasListeners):
         self.seat.set_keyboard(keyboard)
         return device
 
+    def _add_new_touch(self, wlr_device: input_device.InputDevice) -> inputs.Touch:
+        device = inputs.Touch(self, wlr_device)
+        self.cursor.attach_input_device(wlr_device)
+        self.touch_devices.append(device)
+        return device
+
+    def update_capabilities(self) -> None:
+        capabilities = WlSeat.capability.pointer
+        if self.keyboards:
+            capabilities |= WlSeat.capability.keyboard
+        if self.touch_devices:
+            capabilities |= WlSeat.capability.touch
+        self.seat.set_capabilities(capabilities)
+
     def _configure_pending_inputs(self) -> None:
         """Configure inputs that were detected before the config was loaded."""
         assert self.qtile is not None
@@ -1312,7 +1418,7 @@ class Core(base.Core, wlrq.HasListeners):
 
         # Apply input device configuration
         if self.qtile.config.wl_input_rules:
-            for device in [*self.keyboards, *self._pointers]:
+            for device in [*self.keyboards, *self._pointers, *self.touch_devices]:
                 device.configure(self.qtile.config.wl_input_rules)
 
     def new_wid(self) -> int:
@@ -1668,7 +1774,7 @@ class Core(base.Core, wlrq.HasListeners):
     def get_inputs(self) -> dict[str, list[dict[str, str]]]:
         """Get information on all input devices."""
         info: defaultdict[str, list[dict]] = defaultdict(list)
-        devices: list[inputs._Device] = self.keyboards + self._pointers  # type: ignore
+        devices: list[inputs._Device] = self.keyboards + self._pointers + self.touch_devices # type: ignore
 
         for dev in devices:
             type_key, identifier = dev.get_info()

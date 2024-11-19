@@ -231,6 +231,7 @@ class Keyboard(_Device):
             # the previous keyboard as the new active keyboard.
             if self.core.keyboards:
                 self.seat.set_keyboard(self.core.keyboards[-1].keyboard)
+        self.core.update_capabilities()
 
     def set_keymap(self, layout: str | None, options: str | None, variant: str | None) -> None:
         """
@@ -324,6 +325,7 @@ class Pointer(_Device):
     def finalize(self) -> None:
         super().finalize()
         self.core._pointers.remove(self)
+        self.core.update_capabilities()
 
     def configure(self, configs: dict[str, InputConfig]) -> None:
         """Applies ``InputConfig`` rules to this pointer device."""
@@ -397,3 +399,13 @@ class Pointer(_Device):
                     lib.libinput_device_config_tap_set_button_map(
                         handle, TAP_MAPS.get(config.tap_button_map)
                     )
+
+class Touch(Pointer):
+    def finalize(self) -> None:
+        super(Pointer, self).finalize() # HACK: run finalize of _Device only (to not try removing touch object from pointers in Pointer.finalize)
+        self.core.touch_devices.remove(self)
+        self.core.update_capabilities()
+
+    def _on_destroy(self, _listener: Listener, _data: Any) -> None:
+        logger.debug("Signal: touch_device destroy")
+        self.finalize()
